@@ -535,9 +535,14 @@ dependencies = [
 name = "ccd-tax"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "clap",
  "concordium-rust-sdk",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
