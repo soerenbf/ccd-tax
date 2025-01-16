@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hash::Hash};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -12,11 +12,13 @@ const URL: &str = "https://wallet-proxy.mainnet.concordium.software";
 #[derive(Parser, Debug)]
 #[clap(name = "AccountAddressList")]
 struct Args {
-    #[clap(short, long = "account")]
+    #[clap(short = 'a', long = "account")]
     accounts: Vec<AccountAddress>,
+    #[clap(short = 'l', long = "api-limit", default_value = "100")]
+    api_limit: u16,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Details {
     Transfer {
@@ -31,32 +33,39 @@ enum Details {
     ConfigureDelegation {},
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Transaction {
     #[serde(rename = "transactionHash")]
-    hash: TransactionHash,
+    hash: Option<TransactionHash>,
     #[serde(deserialize_with = "deserialize_block_time")]
     block_time: DateTime<Utc>,
     details: Details,
     cost: Option<Amount>,
-}
-
-impl Hash for Transaction {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
-    }
+    id: u64,
 }
 
 impl PartialEq for Transaction {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.id == other.id
     }
 }
 
 impl Eq for Transaction {}
 
-#[derive(Deserialize, Debug)]
+impl PartialOrd for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.block_time.cmp(&other.block_time))
+    }
+}
+
+impl Ord for Transaction {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.block_time.cmp(&other.block_time)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TransactionsResponse {
     count: u16,
@@ -74,22 +83,40 @@ where
     Ok(time)
 }
 
+async fn request_transactions(
+    account: &AccountAddress,
+    limit: u16,
+    from: Option<u64>,
+) -> anyhow::Result<(TransactionsResponse, bool)> {
+    let mut url = format!("{URL}/v1/accTransactions/{account}?limit={limit}");
+    if let Some(from) = from {
+        url.push_str(&format!("&from={from}"));
+    }
+    let res: TransactionsResponse = reqwest::get(url).await?.json().await?;
+    let has_more = res.count == res.limit;
+
+    Ok((res, has_more))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let mut transactions = HashSet::new();
+    let mut transactions = BTreeSet::new();
 
     for account in &args.accounts {
-        let res: TransactionsResponse =
-            reqwest::get(format!("{URL}/v1/accTransactions/{}?limit=1000", account))
-                .await?
-                .json()
-                .await?;
+        let mut from = None;
+        loop {
+            let (res, has_more) = request_transactions(account, args.api_limit, from).await?;
+            transactions.extend(res.transactions.clone());
 
-        transactions.extend(res.transactions);
+            if !has_more { break; }
+            let Some(tx) = res.transactions.last() else { break; };
+
+            from = Some(tx.id);
+        }
     }
 
-    println!("success");
+    println!("success {}", transactions.len());
 
     Ok(())
 }
