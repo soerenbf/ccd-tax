@@ -12,8 +12,12 @@ const URL: &str = "https://wallet-proxy.mainnet.concordium.software";
 #[derive(Parser, Debug)]
 #[clap(name = "AccountAddressList")]
 struct Args {
+    /// The accounts to include in the result. These are also used to exclude transactions where
+    /// both sender and receiver is in the list, as these are internal transfers with no relevance
+    /// for tax purposes.
     #[clap(short = 'a', long = "account")]
     accounts: Vec<AccountAddress>,
+    /// The amount of transactions to request per request made to the API.
     #[clap(short = 'l', long = "api-limit", default_value = "100")]
     api_limit: u16,
 }
@@ -29,6 +33,7 @@ enum Details {
         #[serde(rename = "transferAmount")]
         amount: Amount,
     },
+    // The details of other transactions are not of interest for this specific use-case.
     PaydayAccountReward {},
     ConfigureDelegation {},
 }
@@ -92,6 +97,7 @@ async fn request_transactions(
     if let Some(from) = from {
         url.push_str(&format!("&from={from}"));
     }
+
     let res: TransactionsResponse = reqwest::get(url).await?.json().await?;
     let has_more = res.count == res.limit;
 
@@ -109,14 +115,20 @@ async fn main() -> anyhow::Result<()> {
             let (res, has_more) = request_transactions(account, args.api_limit, from).await?;
             transactions.extend(res.transactions.clone());
 
-            if !has_more { break; }
-            let Some(tx) = res.transactions.last() else { break; };
+            if !has_more {
+                break;
+            }
+            let Some(tx) = res.transactions.last() else {
+                break;
+            };
 
             from = Some(tx.id);
         }
     }
 
-    println!("success {}", transactions.len());
+    println!("pre filter {}", &transactions.len());
+    transactions.retain(|tx| !matches!(tx.details, Details::Transfer { from, to, amount: _ } if args.accounts.contains(&from) && args.accounts.contains(&to)));
+    println!("success {}", &transactions.len());
 
     Ok(())
 }
