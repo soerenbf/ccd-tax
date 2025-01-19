@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use concordium_rust_sdk::{
-    base::hashes::TransactionHash, common::types::Amount, id::types::AccountAddress,
+    base::hashes::{BlockHash, TransactionHash}, common::types::Amount, id::types::AccountAddress,
 };
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const URL: &str = "https://wallet-proxy.mainnet.concordium.software";
 
@@ -20,6 +20,28 @@ struct Args {
     /// The amount of transactions to request per request made to the API.
     #[clap(short = 'l', long = "api-limit", default_value = "100")]
     api_limit: u16,
+    /// The output format. Currently only "koinly" is supported
+    #[clap(value_enum, default_value_t = Format::Koinly)]
+    format: Format,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum Format {
+    Koinly
+}
+
+#[derive(Debug, Serialize)]
+enum KoinlyLabel {
+    Fee,
+    Mining,
+}
+
+struct KoinlyRow {
+    date: String,
+    amount: f64,
+    currency: String,
+    label: Option<KoinlyLabel>,
+    transaction_hash: Option<TransactionHash>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -35,21 +57,25 @@ enum Details {
     },
     // The details of other transactions are not of interest for this specific use-case.
     PaydayAccountReward {},
-    ConfigureDelegation {},
+    // Catch-all makes sure don't crash on transactions where the details are not of interest.
+    #[serde(untagged)]
+    Other {},
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Transaction {
     #[serde(rename = "transactionHash")]
-    hash: Option<TransactionHash>,
+    hash: Option<TransactionHash>, // Not available for reward types
+    block_hash: BlockHash, // Can be used as a reference when looking up rewards for the receiver
     #[serde(deserialize_with = "deserialize_block_time")]
     block_time: DateTime<Utc>,
     details: Details,
-    cost: Option<Amount>,
+    cost: Option<Amount>, // Not available for reward types
     id: u64,
 }
 
+// Avoid duplicates by using the ID from the DB
 impl PartialEq for Transaction {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
