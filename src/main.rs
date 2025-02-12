@@ -1,12 +1,10 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use concordium_rust_sdk::{
-    base::hashes::TransactionHash,
-    common::types::Amount,
-    id::types::AccountAddress,
+    base::hashes::TransactionHash, common::types::Amount, id::types::AccountAddress,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -26,6 +24,9 @@ struct Args {
     /// The output format. Currently only "koinly" is supported
     #[clap(value_enum, default_value_t = Format::Koinly)]
     format: Format,
+    /// The output file path.
+    #[clap(short = 'o', long = "output")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -233,6 +234,13 @@ async fn main() -> anyhow::Result<()> {
     println!("pre filter {}", &transactions.len());
     transactions.retain(|tx| !matches!(tx.details, Details::Transfer { from, to } if args.accounts.contains(&from) && args.accounts.contains(&to)));
     println!("success {}", &transactions.len());
+    println!(
+        "payday rewards {}",
+        transactions
+            .iter()
+            .filter(|tx| matches!(tx.details, Details::PaydayAccountReward {}))
+            .count()
+    );
 
     let formatted: Vec<KoinlyRow> = transactions
         .iter()
@@ -240,9 +248,20 @@ async fn main() -> anyhow::Result<()> {
         .flatten()
         .collect();
 
-    for row in formatted.iter() {
-        println!("{:?}", row);
+    let Some(output) = &args.output else {
+        for row in formatted.iter() {
+            println!("{:?}", row);
+        }
+        return Ok(());
+    };
+
+    let mut wtr = csv::Writer::from_path(output)?;
+    for row in formatted {
+        wtr.serialize(row)?;
     }
+    wtr.flush()?;
+
+    println!("Successfully wrote data to {output:?}");
 
     Ok(())
 }
