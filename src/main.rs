@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use concordium_rust_sdk::{
-    base::hashes::{BlockHash, TransactionHash}, common::types::Amount, id::types::AccountAddress,
+    base::hashes::TransactionHash,
+    common::types::Amount,
+    id::types::AccountAddress,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -27,7 +30,7 @@ struct Args {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Format {
-    Koinly
+    Koinly,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,24 +39,86 @@ enum KoinlyLabel {
     Mining,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
 struct KoinlyRow {
+    #[serde(rename = "Koinly Date")]
     date: String,
     amount: f64,
     currency: String,
     label: Option<KoinlyLabel>,
-    transaction_hash: Option<TransactionHash>,
+    tx_hash: Option<TransactionHash>,
+}
+
+impl KoinlyRow {
+    fn new_ccd(
+        date: String,
+        amount: f64,
+        label: Option<KoinlyLabel>,
+        tx_hash: Option<TransactionHash>,
+    ) -> Self {
+        Self {
+            date,
+            amount,
+            currency: "CCD".to_string(),
+            label,
+            tx_hash,
+        }
+    }
+}
+
+impl TryFrom<&Transaction> for Vec<KoinlyRow> {
+    type Error = anyhow::Error;
+
+    fn try_from(tx: &Transaction) -> Result<Self, Self::Error> {
+        let total = tx.total.context("no amount found")?;
+        let amount = tx.subtotal.unwrap_or(total) as f64 / 1_000_000.0;
+        let label = match tx.details {
+            Details::PaydayAccountReward {} => Some(KoinlyLabel::Mining),
+            _ => None,
+        };
+
+        let value = KoinlyRow::new_ccd(
+            tx.block_time
+                .naive_utc()
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string(),
+            amount,
+            label,
+            tx.hash,
+        );
+
+        let Some(cost) = tx.cost else {
+            return Ok(vec![value]);
+        };
+
+        let fee = KoinlyRow::new_ccd(
+            tx.block_time
+                .naive_utc()
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string(),
+            -(cost.micro_ccd as f64 / 1_000_000.0),
+            Some(KoinlyLabel::Fee),
+            tx.hash,
+        );
+
+        if Amount::from_micro_ccd(total.unsigned_abs()) == cost {
+            // We're not transferring any funds, only paying a fee.
+            return Ok(vec![fee]);
+        }
+        return Ok(vec![value, fee]);
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Details {
+    // The addresses are used to figure out if the transfer is internal or not.
     Transfer {
         #[serde(rename = "transferSource")]
         from: AccountAddress,
         #[serde(rename = "transferDestination")]
         to: AccountAddress,
-        #[serde(rename = "transferAmount")]
-        amount: Amount,
     },
     // The details of other transactions are not of interest for this specific use-case.
     PaydayAccountReward {},
@@ -62,16 +127,29 @@ enum Details {
     Other {},
 }
 
+fn deserialize_micro_ccd<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    opt.map(|s| s.parse::<i64>().map_err(serde::de::Error::custom))
+        .transpose()
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Transaction {
     #[serde(rename = "transactionHash")]
     hash: Option<TransactionHash>, // Not available for reward types
-    block_hash: BlockHash, // Can be used as a reference when looking up rewards for the receiver
+    // block_hash: BlockHash, // Can be used as a reference when looking up rewards for the receiver
     #[serde(deserialize_with = "deserialize_block_time")]
     block_time: DateTime<Utc>,
     details: Details,
     cost: Option<Amount>, // Not available for reward types
+    #[serde(default, deserialize_with = "deserialize_micro_ccd")]
+    subtotal: Option<i64>, // Contains signed amount in micro CCD excluding the `cost`
+    #[serde(deserialize_with = "deserialize_micro_ccd")]
+    total: Option<i64>, // Contains signed amount in micro CCD
     id: u64,
 }
 
@@ -153,8 +231,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("pre filter {}", &transactions.len());
-    transactions.retain(|tx| !matches!(tx.details, Details::Transfer { from, to, amount: _ } if args.accounts.contains(&from) && args.accounts.contains(&to)));
+    transactions.retain(|tx| !matches!(tx.details, Details::Transfer { from, to } if args.accounts.contains(&from) && args.accounts.contains(&to)));
     println!("success {}", &transactions.len());
+
+    let formatted: Vec<KoinlyRow> = transactions
+        .iter()
+        .filter_map(|tx| Vec::<KoinlyRow>::try_from(tx).ok())
+        .flatten()
+        .collect();
+
+    for row in formatted.iter() {
+        println!("{:?}", row);
+    }
 
     Ok(())
 }
